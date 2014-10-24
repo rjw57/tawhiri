@@ -5,6 +5,8 @@ python:
     - "3.3"
 
 install:
+    # Required distro packages
+    - "sudo apt-get install -y libgrib-api-dev"
     # Install coveralls (coverage support for travis)
     - "pip install coveralls"
     # Install (specific) requirements and ourself

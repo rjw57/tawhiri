@@ -5,5 +5,9 @@ Cython
 sphinx
 docutils
 
+# Specific versions
+https://pygrib.googlecode.com/files/pygrib-1.9.6.tar.gz#egg=pygrib
+gevent<1.0
+
 # Ourselves
 -e .

@@ -1,4 +1,4 @@
-# Copyright 2014 (C) Priyesh Patel
+# Copyright 2014 (C) Rich Wareham <rich.cusf@richwareham.com>
 #
 # This file is part of Tawhiri.
 #
@@ -14,16 +14,15 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Tawhiri.  If not, see <http://www.gnu.org/licenses/>.
+"""
+Provide an experimental HTTP API for Tawhiri as a Flask Blueprint.
 
 """
-The main Tawhiri web application
-"""
+from flask import Blueprint, jsonify
 
-from flask import Flask
+api = Blueprint('api_experimental', __name__)
 
-from .api import api_v1
-from .experimentalapi import api as api_experimental
+@api.route('/')
+def index():
+    return jsonify(dict(version=2))
 
-app = Flask(__name__)
-app.register_blueprint(api_v1, url_prefix='/api/v1')
-app.register_blueprint(api_experimental, url_prefix='/api/broken')

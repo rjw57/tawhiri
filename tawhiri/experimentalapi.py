@@ -90,6 +90,8 @@ Other distributions are defined as follows::
         "high": <number>,           // samples will be <= high
     }
 
+FIXME: the response type is currently up in the air. (No pun intended.)
+
 Other entry points
 ==================
 

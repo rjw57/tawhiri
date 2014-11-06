@@ -106,6 +106,10 @@ import random
 from flask import Blueprint, jsonify, request, current_app
 from werkzeug.exceptions import BadRequest
 
+from tawhiri import solver, models
+from tawhiri.dataset import Dataset as WindDataset
+from ruaumoko import Dataset as ElevationDataset
+
 api = Blueprint('api_experimental', __name__)
 
 @api.route('/')
@@ -120,6 +124,7 @@ def predict():
     if json is None:
         raise BadRequest()
 
+    # Parse JSON body into a prediction spec.
     try:
         prediction_spec = prediction_spec_from_json(json)
     except (IndexError, ValueError, KeyError) as e:
@@ -128,7 +133,10 @@ def predict():
         else:
             raise BadRequest()
 
-    return str(prediction_spec)
+    # Run predictions
+    results = run_predictions(prediction_spec)
+
+    return jsonify(dict(results=results))
 
 LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
 SimpleAltitudeProfile = namedtuple(
@@ -140,6 +148,57 @@ PredictionSpec = namedtuple(
     ['launch', 'profile', 'sample_count']
 )
 
+### RUNNING THE PREDICTOR ###
+
+def ruaumoko_ds():
+    if not hasattr("ruaumoko_ds", "once"):
+        ds_loc = current_app.config.get(
+            'ELEVATION_DATASET', ElevationDataset.default_location
+        )
+        ruaumoko_ds.once = ElevationDataset(ds_loc)
+
+    return ruaumoko_ds.once
+
+def run_predictions(spec):
+    """Sample and run predictions according to the passed PredictionSpec.
+
+    """
+
+    # Find wind data location
+    ds_dir = current_app.config.get(
+        'WIND_DATASET_DIR', WindDataset.DEFAULT_DIRECTORY
+    )
+
+    # Load dataset
+    tawhiri_ds = WindDataset.open_latest(persistent=True, directory=ds_dir)
+
+    # TODO: make this Python2 friendly
+    results = []
+    for _ in range(spec.sample_count):
+        # Draw ascent profile
+        ascent_rate = spec.profile.ascent_rate()
+        descent_rate = spec.profile.descent_rate()
+        burst_alt = spec.profile.burst_alt()
+
+        # Create ascent profile
+        stages = models.standard_profile(
+            ascent_rate, burst_alt, descent_rate,
+            tawhiri_ds, ruaumoko_ds()
+        )
+
+        # Draw launch site
+        lat = spec.launch.lat()
+        lng = spec.launch.lng()
+        alt = spec.launch.alt()
+        when = spec.launch.when()
+
+        # Run
+        results.append(solver.solve(when, lat, lng, alt, stages))
+
+    return results
+
+### PARSING OF SPEC FROM JSON REQUESTS ###
+
 def prediction_spec_from_json(json):
     """Construct a new PredictionSpec from a dictionary representing a
     prediction specification encoded as per the API documentation. Raises
@@ -148,7 +207,13 @@ def prediction_spec_from_json(json):
     """
     launch = launch_from_json(json['launch'])
     profile = profile_from_json(json['profile'])
-    sample_count = float(json['sampleCount'])
+    sample_count = int(json['sampleCount'])
+
+    if sample_count <= 0:
+        raise ValueError('Sample count must be positive')
+    if sample_count > 1000:
+        raise ValueError('Sample count is too large')
+
     return PredictionSpec(
         launch=launch, profile=profile, sample_count=sample_count
     )

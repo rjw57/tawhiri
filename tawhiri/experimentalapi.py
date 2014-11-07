@@ -25,13 +25,15 @@ POST-ed to it with the following form:
 
     <request> := {
         "launch": <launchSpec>,
-        "profile": <altitudeProfile>,
+        "profile": <simpleAltitudeProfile>,
         "sampleCount": <number>
     }
 
-The sampleCount field provides an indication of the desired number of sample
-trajectories drawn. It is a hint only. The predictor may decide to draw fewer
-samples if the prediction is taking too long.
+The launch field specifies where and when the launch is to occur. The profile
+field specifies the altitude profile of the balloon.  The sampleCount field
+provides an indication of the desired number of sample trajectories drawn. It
+is a hint only. The predictor may decide to draw fewer samples if the
+prediction is taking too long.
 
 A launchSpec specifies where and when a launch is intended to occur and has the
 following form:
@@ -48,22 +50,14 @@ is specified in metres. Together they locate the launch site in space. The
 when field is specified as the number of seconds since UTC 00:00 01 Jan 1970.
 The value may be negative.
 
-An altitudeProfile specifies the expected altitude profile for the balloon and
-has the following form::
+A simpleAltitudeProfile specifies the expected altitude profile for the balloon
+and has the following form::
 
-    <altitudeProfile> := {
+    <simpleAltitudeProfile> := {
         "type": "simple",
-        "parameters": <simpleProfileParameters>
-    }
-
-Currently the only supported type is "simple". The parameters field contains
-profile-type dependent fields. For the "simple" type the parameters object
-should have the following format::
-
-    <simpleProfileParameters> := {
         "ascentRate": <sampleable>,
         "descentRate": <sampleable>,
-        "burstAltitude": <sampleable>,
+        "burstAltitude": <sampleable>
     }
 
 A sampleable is defined as follows::
@@ -237,12 +231,12 @@ def profile_from_json(json):
     altitude profile specification.
 
     """
-    type_, params = json['type'], json['parameters']
+    type_ = json['type']
     if type_ == 'simple':
         return SimpleAltitudeProfile(
-            ascent_rate=sampleable_from_json(params['ascentRate']),
-            descent_rate=sampleable_from_json(params['descentRate']),
-            burst_alt=sampleable_from_json(params['burstAltitude']),
+            ascent_rate=sampleable_from_json(json['ascentRate']),
+            descent_rate=sampleable_from_json(json['descentRate']),
+            burst_alt=sampleable_from_json(json['burstAltitude']),
         )
 
     raise ValueError('Unknown altitude profile type: ' + str(type_))

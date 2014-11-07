@@ -100,6 +100,7 @@ from collections import namedtuple
 import random
 
 from flask import Blueprint, jsonify, request, current_app
+import numpy as np
 from werkzeug.exceptions import BadRequest
 
 from tawhiri import solver, models
@@ -130,9 +131,9 @@ def predict():
             raise BadRequest()
 
     # Run predictions
-    results = run_predictions(prediction_spec)
+    means, ellps = run_predictions(prediction_spec)
 
-    return jsonify(dict(results=results))
+    return jsonify(dict(means=means.tolist(), sigmavecs=ellps.tolist()))
 
 LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
 SimpleAltitudeProfile = namedtuple(
@@ -169,7 +170,7 @@ def run_predictions(spec):
     tawhiri_ds = WindDataset.open_latest(persistent=True, directory=ds_dir)
 
     # TODO: make this Python2 friendly
-    results = []
+    results, max_shape = [], (0, 0)
     for _ in range(spec.sample_count):
         # Draw ascent profile
         ascent_rate = spec.profile.ascent_rate()
@@ -188,10 +189,79 @@ def run_predictions(spec):
         alt = spec.launch.alt()
         when = spec.launch.when()
 
-        # Run
-        results.append(solver.solve(when, lat, lng, alt, stages))
+        # Concatenate legs together into single Nx4 array
+        data = np.vstack(solver.solve(when, lat, lng, alt, stages))
 
-    return results
+        # Change time axis to be *relative* offsets
+        data[:, 0] -= data[0, 0]
+
+        max_shape = tuple(max(ms, s) for ms, s in zip(max_shape, data.shape))
+
+        # Add to data list
+        results.append(data)
+
+    return compute_run_stats(results, max_shape)
+
+def cov_to_sigma_ellipse(cov):
+    """Return array whose columns represent one sigma vectors along the
+    principal axes.
+
+    """
+    # Compute eigenvalues and eigenvectors
+    lambdas, vs = np.linalg.eig(cov)
+
+    # Compute "one sigma" vectors
+    for idx, sigma in enumerate(np.sqrt(np.maximum(0, lambdas))):
+        vs[:, idx] *= sigma
+    vs = np.ma.getdata(np.ma.fix_invalid(vs, fill_value=0))
+
+    # Choose most vertical (i.e. one with greatest abs z component)
+    most_vert_idx = np.argmax(np.abs(vs[2, :]))
+    vert_v = np.atleast_2d(vs[:, most_vert_idx]).T
+    if vert_v[2, 0] < 0:
+        vert_v *= -1
+    vs = np.hstack((vs[:, :most_vert_idx], vs[:, most_vert_idx+1:]))
+
+    # Choose most north-south
+    most_ns_idx = np.argmax(np.abs(vs[1, :]))
+    ns_v = np.atleast_2d(vs[:, most_ns_idx]).T
+    if ns_v[1, 0] < 0:
+        ns_v *= -1
+    vs = np.hstack((vs[:, :most_ns_idx], vs[:, most_ns_idx+1:]))
+
+    assert vs.shape[1] == 1
+    if vs[0, 0] < 0:
+        vs *= -1
+
+    # Use this order
+    vs = np.hstack((vert_v, ns_v, vs))
+
+    return vs
+
+def compute_run_stats(results, max_shape):
+    # Form combined array of timesteps x obs x samples
+    combined_runs = np.zeros(max_shape + (len(results),))
+    combined_runs[:] = np.nan
+    for idx, r in enumerate(results):
+        combined_runs[:r.shape[0], :, idx] = r
+    assert combined_runs.shape[1] == 4
+
+    # Convert combined_runs into a masked array
+    combined_runs = np.ma.masked_invalid(combined_runs)
+
+    # Compute ensemble mean
+    means = np.ma.mean(combined_runs, axis=-1)
+
+    # Compute one sigma ellipses. Note that since we're dealing with relative
+    # time, we expect the covariance of the time dimension to be negligible.
+    ellps = list(
+        cov_to_sigma_ellipse(np.ma.getdata(np.ma.cov(row[1:, :])))
+        for row in combined_runs
+    )
+
+    # Output is means (Nx4), ellps (Nx4x4). Each "row" of ellps being an array
+    # whose rows are the one-sigma vectors.
+    return np.ma.getdata(means), np.dstack(ellps).T
 
 ### PARSING OF SPEC FROM JSON REQUESTS ###
 

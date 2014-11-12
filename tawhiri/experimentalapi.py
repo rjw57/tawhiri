@@ -59,30 +59,35 @@ def predict_geojson():
     # Parse request body
     prediction_spec = parse_prediction_spec_request()
 
+    # Modal track
+    modal_track = run_modal_prediction(prediction_spec)
+
     # Run predictions
     results = run_predictions(prediction_spec)
 
     # Compute some stats
-    mean_track, l_mean, l_cov = compute_run_statistics(results)
+    _, l_mean, l_cov = compute_run_statistics(results)
 
     # List to hold output features
     features = []
 
-    # Create mean track feature
+    # Create modal track feature
     features.append(dict(
         type='Feature',
         geometry=dict(
-            type='LineString', coordinates=mean_track[:, 1:].tolist()
+            type='LineString',
+            # Note swizzling of lat/lng into lng/lat order
+            coordinates=modal_track[:, [2, 1, 3]].tolist()
         ),
         properties=dict(
-            times=mean_track[:, 0].tolist(),
+            times=modal_track[:, 0].tolist(),
             OGR_STYLE='PEN(c:#00FF00)',
             altitudeMode='absolute',
         ),
     ))
 
     # Compute landing covariance 1 sigma vectors (ignoring time)
-    lambdas, sigma_vs = np.linalg.eig(l_cov[1:,1:])
+    lambdas, sigma_vs = np.linalg.eig(l_cov[1:, 1:])
     for col_idx in range(3):
         sigma_vs[:, col_idx] *= np.sqrt(np.maximum(0, lambdas[col_idx]))
 
@@ -91,26 +96,28 @@ def predict_geojson():
     ellipse_axes = sigma_vs[:, np.argsort(sigma_vs[2, :])[:2]]
 
     # Generate ellipse
-    thetas = np.linspace(0, 2*np.pi, 32)
+    n_thetas = 32
+    thetas = np.linspace(0, 2*np.pi, n_thetas)
     sins, coss = np.sin(thetas), np.cos(thetas)
     landing_poly_coords = np.repeat(
-        l_mean[1:].reshape((1, -1)), thetas.shape[0], axis=0)
+        l_mean[1:3].reshape((1, -1)), n_thetas, axis=0)
     landing_poly_coords += np.dot(
         sins.reshape((-1, 1)),
-        ellipse_axes[:, 0].reshape((1, -1))
+        3 * ellipse_axes[:2, 0].reshape((1, -1))
     )
     landing_poly_coords += np.dot(
         coss.reshape((-1, 1)),
-        ellipse_axes[:, 1].reshape((1, -1))
+        3 * ellipse_axes[:2, 1].reshape((1, -1))
     )
+
     features.append(dict(
         type='Feature',
         geometry=dict(
             type='Polygon',
-            coordinates=[landing_poly_coords.tolist()],
+            # Note swizzling of lat/lng into lng/lat order
+            coordinates=[landing_poly_coords[:, [1, 0]].tolist()],
         ),
         properties=dict(
-            altitudeMode='absolute',
             OGR_STYLE='BRUSH(fc:#FF000080);PEN(c:#FFFFFF00)',
         )
     ))
@@ -141,12 +148,49 @@ def ruaumoko_ds():
 
     return ruaumoko_ds.once
 
-def run_predictions(spec):
-    """Sample and run predictions according to the passed PredictionSpec.
+
+def run_modal_prediction(spec):
+    """Sample and run a modal prediction according to the passed PredictionSpec.
 
     Returns a sequence of a Nx4 arrays where each row is a prediction for a
     different time point.  Each prediction is a 4-tuple of UNIX timestamp,
     latitude, longitude, altitude.
+
+    """
+    # Find wind data location
+    ds_dir = current_app.config.get(
+        'WIND_DATASET_DIR', WindDataset.DEFAULT_DIRECTORY
+    )
+
+    # Load dataset
+    tawhiri_ds = WindDataset.open_latest(persistent=True, directory=ds_dir)
+
+    # Ascent profile
+    ascent_rate = spec.profile.ascent_rate.mode
+    descent_rate = spec.profile.descent_rate.mode
+    burst_alt = spec.profile.burst_alt.mode
+
+    # Create ascent profile
+    stages = models.standard_profile(
+        ascent_rate, burst_alt, descent_rate,
+        tawhiri_ds, ruaumoko_ds()
+    )
+
+    # Launch site
+    lat = spec.launch.lat.mode
+    lng = spec.launch.lng.mode
+    alt = spec.launch.alt.mode
+    when = spec.launch.when.mode
+
+    # Concatenate legs together into single Nx4 array
+    return np.vstack(solver.solve(when, lat, lng, alt, stages))
+
+def run_predictions(spec):
+    """Sample and run predictions according to the passed PredictionSpec.
+
+    Returns a Nx4 array where each row is a prediction for a different time
+    point. Each prediction is a 4-tuple of UNIX timestamp, latitude, longitude,
+    altitude.
 
     """
     # Find wind data location
@@ -281,13 +325,16 @@ def sampleable_from_json(json):
     object or number.
 
     A sampleable is simply a callable which returns a floating point value
-    drawn from some distribution.
+    drawn from some distribution. It has a mode attribute giving the mode of
+    the distribution.
 
     """
     try:
         # Treat as simple number
         num = float(json)
-        return lambda: num
+        sampleable = lambda: num
+        sampleable.mode = num
+        return sampleable
     except (TypeError, ValueError):
         # OK, continue trying to treat json as a dict
         pass
@@ -295,9 +342,13 @@ def sampleable_from_json(json):
     type_ = json['type']
     if type_ == 'gaussian':
         mu, sigma = float(json['mu']), float(json['sigma'])
-        return lambda: random.gauss(mu, sigma)
+        sampleable = lambda: random.gauss(mu, sigma)
+        sampleable.mode = mu
+        return sampleable
     elif type_ == 'uniform':
         low, high = float(json['low']), float(json['high'])
-        return lambda: random.uniform(low, high)
+        sampleable = lambda: random.uniform(low, high)
+        sampleable.mode = 0.5 * (low + high)
+        return sampleable
     else:
         raise ValueError('Bad sampleable type: ' + repr(type_))

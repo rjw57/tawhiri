@@ -23,7 +23,7 @@ from contextlib import contextmanager
 import json
 import random
 
-from flask import Blueprint, jsonify, request, current_app, Response
+from flask import Blueprint, jsonify, request, current_app
 import numpy as np
 from osgeo import ogr, gdal
 import pyproj

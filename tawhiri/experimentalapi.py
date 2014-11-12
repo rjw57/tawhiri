@@ -19,11 +19,15 @@ Provide an experimental HTTP API for Tawhiri as a Flask Blueprint.
 
 """
 from collections import namedtuple
+from contextlib import contextmanager
+import json
 import random
 
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, jsonify, request, current_app, Response
 import numpy as np
-from werkzeug.exceptions import BadRequest
+from osgeo import ogr, gdal
+import pyproj
+from werkzeug.exceptions import BadRequest, NotFound
 
 from tawhiri import solver, models
 from tawhiri.dataset import Dataset as WindDataset
@@ -44,29 +48,121 @@ def predict():
     results = run_predictions(prediction_spec)
 
     # Compute some stats
-    mean_track, landing_mean, landing_cov = compute_run_statistics(results)
+    landing_mean, landing_cov = compute_run_statistics(results)
 
     return jsonify(dict(
-        mean=mean_track.tolist(),
         landing=dict(
             mean=landing_mean.tolist(),
             cov=landing_cov.tolist(),
         ),
     ))
 
-@api.route('/predict.geojson', methods=['POST'])
-def predict_geojson():
+# Mapping between prediction output formats and OGR drivers.
+PREDICT_FORMAT_MAP = {
+    'geojson': ('GeoJSON', 'json'), # NB. GeoJSON is natively emitted.
+    'kml': ('LibKML', 'kml'),
+}
+
+@api.route('/predict.<format>', methods=['POST'])
+def predict_reformat(format):
+    if format not in PREDICT_FORMAT_MAP:
+        raise NotFound()
+
     # Parse request body
     prediction_spec = parse_prediction_spec_request()
 
-    # Modal track
-    modal_track = run_modal_prediction(prediction_spec)
+    # Modal tracks
+    modal_tracks = run_modal_prediction(prediction_spec)
 
     # Run predictions
     results = run_predictions(prediction_spec)
 
     # Compute some stats
-    _, l_mean, l_cov = compute_run_statistics(results)
+    l_mean, l_cov = compute_run_statistics(results)
+
+    geojson_fc = runs_to_geojson(modal_tracks, l_mean, l_cov)
+
+    if format == 'geojson':
+        # We're done
+        return jsonify(geojson_fc)
+
+    # Otherwise, convert via OGR
+    return ogr_convert_geojson(geojson_fc, *PREDICT_FORMAT_MAP[format])
+
+LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
+SimpleAltitudeProfile = namedtuple(
+    'SimpleAltitudeProfile',
+    ['ascent_rate', 'burst_alt', 'descent_rate']
+)
+PredictionSpec = namedtuple(
+    'PredictionSpec',
+    ['launch', 'profile', 'sample_count']
+)
+
+### FORMATTING OUTPUT ###
+
+@contextmanager
+def vsi_open(path, mode):
+    """A context manager for GDAL's VSI filesystem interface which ensures that
+    files are closed after use.
+
+    """
+    handle = gdal.VSIFOpenL(path, mode)
+    yield handle
+    gdal.VSIFCloseL(handle)
+
+@contextmanager
+def vsi_tempfile(prefix, extension):
+    """A context manage which creates a temporary VSI file, returns the name
+    and then unlinks it. Note that this is *not* safe against malicious intent
+    and so one should only use this for /vsimem/... paths.
+
+    """
+    alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    temp_id = ''.join(list(random.choice(alpha) for _ in range(6)))
+    name = '{0}{1}.{2}'.format(prefix, temp_id, extension)
+    hn = gdal.VSIFOpenL(name, 'w')
+    gdal.VSIFCloseL(hn)
+    yield name
+    rv = gdal.Unlink(name)
+    assert rv == 0
+
+def ogr_convert_geojson(src, driver_name, extension):
+    in_tmp = vsi_tempfile('/vsimem/input', 'geojson')
+    out_tmp = vsi_tempfile('/vsimem/output', extension)
+
+    with in_tmp as in_path, out_tmp as out_path:
+        gdal.FileFromMemBuffer(in_path, json.dumps(src))
+        src_ds = ogr.Open(in_path)
+        assert src_ds is not None
+
+        drv = ogr.GetDriverByName(driver_name)
+        assert drv is not None
+
+        dst_ds = drv.CreateDataSource(out_path)
+        assert dst_ds is not None
+
+        for l_idx in range(src_ds.GetLayerCount()):
+            layer = src_ds.GetLayerByIndex(l_idx)
+            dst_ds.CopyLayer(layer, layer.GetName())
+
+        dst_ds.SyncToDisk()
+
+        with vsi_open(out_path, 'rb') as dst_handle:
+            assert dst_handle is not None
+
+            # How much data is there
+            gdal.VSIFSeekL(dst_handle, 0, 2)
+            total_size = gdal.VSIFTellL(dst_handle)
+            gdal.VSIFSeekL(dst_handle, 0, 0)
+
+            dst_data = gdal.VSIFReadL(1, total_size, dst_handle)
+            assert dst_data is not None
+
+    return dst_data
+
+def runs_to_geojson(modal_tracks, l_mean, l_cov):
+    modal_tracks_wgs84 = list(geocentric_to_wgs84(t) for t in modal_tracks)
 
     # List to hold output features
     features = []
@@ -75,12 +171,11 @@ def predict_geojson():
     features.append(dict(
         type='Feature',
         geometry=dict(
-            type='LineString',
-            # Note swizzling of lat/lng into lng/lat order
-            coordinates=modal_track[:, [2, 1, 3]].tolist()
+            type='MultiLineString',
+            coordinates=list(t[:, 1:].tolist() for t in modal_tracks_wgs84),
         ),
         properties=dict(
-            times=modal_track[:, 0].tolist(),
+            times=list(t[:, 0].tolist() for t in modal_tracks_wgs84),
             OGR_STYLE='PEN(c:#00FF00)',
             altitudeMode='absolute',
         ),
@@ -92,50 +187,51 @@ def predict_geojson():
         sigma_vs[:, col_idx] *= np.sqrt(np.maximum(0, lambdas[col_idx]))
 
     # Columns of sigma_vs are lat, lng, alt triples pointing along principal
-    # axes of ellipse of uncertainty. Choose those with *smallest* altitudes.
-    ellipse_axes = sigma_vs[:, np.argsort(sigma_vs[2, :])[:2]]
+    # axes of ellipse of uncertainty. Choose those with *largest* uncertainty.
+    sigma_sq_mags = np.sum(sigma_vs ** 2, axis=0)
+    ellipse_axes = sigma_vs[:, np.argsort(sigma_sq_mags)[-2:]]
 
     # Generate ellipse
     n_thetas = 32
-    thetas = np.linspace(0, 2*np.pi, n_thetas)
-    sins, coss = np.sin(thetas), np.cos(thetas)
-    landing_poly_coords = np.repeat(
-        l_mean[1:3].reshape((1, -1)), n_thetas, axis=0)
-    landing_poly_coords += np.dot(
-        sins.reshape((-1, 1)),
-        3 * ellipse_axes[:2, 0].reshape((1, -1))
-    )
-    landing_poly_coords += np.dot(
-        coss.reshape((-1, 1)),
-        3 * ellipse_axes[:2, 1].reshape((1, -1))
-    )
+    sigma_fills = ['#FF0000FF', '#FF0000BB', '#FF000088', '#FF000044']
+    for sigma_idx, fill in enumerate(sigma_fills):
+        sigma = sigma_idx + 1
 
-    features.append(dict(
-        type='Feature',
-        geometry=dict(
-            type='Polygon',
-            # Note swizzling of lat/lng into lng/lat order
-            coordinates=[landing_poly_coords[:, [1, 0]].tolist()],
-        ),
-        properties=dict(
-            OGR_STYLE='BRUSH(fc:#FF000080);PEN(c:#FFFFFF00)',
+        thetas = np.linspace(0, 2*np.pi, n_thetas)
+        sins, coss = np.sin(thetas), np.cos(thetas)
+        landing_poly_coords = np.repeat(
+            l_mean[1:].reshape((1, -1)), n_thetas, axis=0)
+        landing_poly_coords += np.dot(
+            sins.reshape((-1, 1)),
+            sigma * ellipse_axes[:, 0].reshape((1, -1))
         )
-    ))
+        landing_poly_coords += np.dot(
+            coss.reshape((-1, 1)),
+            sigma * ellipse_axes[:, 1].reshape((1, -1))
+        )
 
-    return jsonify(dict(
-        type='FeatureCollection',
-        features=features
-    ))
+        # Convert polygon co-ordinates to WGS84 lng/lats. Notice that we ignore
+        # altitude.
+        lp_coords_wgs84 = np.zeros((n_thetas, 2))
+        lp_coords_wgs84[:, 0], lp_coords_wgs84[:, 1], _ = pyproj.transform(
+            GEOCENT_PROJECTION, WGS84_PROJECTION,
+            landing_poly_coords[:, 0], landing_poly_coords[:, 1],
+            landing_poly_coords[:, 2]
+        )
 
-LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
-SimpleAltitudeProfile = namedtuple(
-    'SimpleAltitudeProfile',
-    ['ascent_rate', 'burst_alt', 'descent_rate']
-)
-PredictionSpec = namedtuple(
-    'PredictionSpec',
-    ['launch', 'profile', 'sample_count']
-)
+        features.append(dict(
+            type='Feature',
+            geometry=dict(
+                type='Polygon',
+                coordinates=[lp_coords_wgs84.tolist()],
+            ),
+            properties=dict(
+                drawOrder=len(sigma_fills) - sigma_idx,
+                OGR_STYLE='BRUSH(fc:{0});PEN(c:#000000)'.format(fill),
+            )
+        ))
+
+    return dict(type='FeatureCollection', features=features)
 
 ### RUNNING THE PREDICTOR ###
 
@@ -148,13 +244,44 @@ def ruaumoko_ds():
 
     return ruaumoko_ds.once
 
+WGS84_PROJECTION = pyproj.Proj(init='epsg:4326')
+GEOCENT_PROJECTION = pyproj.Proj(proj='geocent', datum='WGS84', units='m')
+
+def solver_to_geocentric(observations):
+    """Take a Nx4 array of time, latitude, longitude, altitude observations and
+    convert it to a Nx4 array of time, x, y and z geo-centric co-ordinates.
+    Time is measured in seconds since the epoch and x, y and z are measured in
+    metres.
+
+    """
+    output = observations.copy()
+    output[:, 1], output[:, 2], output[:, 3] = pyproj.transform(
+        WGS84_PROJECTION, GEOCENT_PROJECTION,
+        observations[:, 2], observations[:, 1], observations[:, 3]
+    )
+    return output
+
+def geocentric_to_wgs84(observations):
+    """Take a Nx4 array of time, x, y, z observations and convert it to a Nx4
+    array of time, longitude, latitude and altitude geo-centric co-ordinates.
+    Time is measured in seconds since the epoch and x, y and z are measured in
+    metres. NOTE ordering of longitude and latitude. This function is *NOT* the
+    inverse of solver_to_geocentric().
+
+    """
+    output = observations.copy()
+    output[:, 1], output[:, 2], output[:, 3] = pyproj.transform(
+        GEOCENT_PROJECTION, WGS84_PROJECTION,
+        observations[:, 1], observations[:, 2], observations[:, 3]
+    )
+    return output
 
 def run_modal_prediction(spec):
     """Sample and run a modal prediction according to the passed PredictionSpec.
 
-    Returns a sequence of a Nx4 arrays where each row is a prediction for a
-    different time point.  Each prediction is a 4-tuple of UNIX timestamp,
-    latitude, longitude, altitude.
+    Returns a Nx4 array where each row is a prediction for a different time
+    point. Each prediction is a 4-tuple of UNIX timestamp, latitude, longitude,
+    altitude.
 
     """
     # Find wind data location
@@ -182,15 +309,17 @@ def run_modal_prediction(spec):
     alt = spec.launch.alt.mode
     when = spec.launch.when.mode
 
-    # Concatenate legs together into single Nx4 array
-    return np.vstack(solver.solve(when, lat, lng, alt, stages))
+    return list(
+        solver_to_geocentric(np.array(r))
+        for r in solver.solve(when, lat, lng, alt, stages)
+    )
 
 def run_predictions(spec):
     """Sample and run predictions according to the passed PredictionSpec.
 
-    Returns a Nx4 array where each row is a prediction for a different time
-    point. Each prediction is a 4-tuple of UNIX timestamp, latitude, longitude,
-    altitude.
+    Returns a sequence of sequences of a Nx4 arrays, one per leg, where each
+    row is a prediction for a different time point. Each prediction is a
+    4-tuple of UNIX timestamp, latitude, longitude, altitude.
 
     """
     # Find wind data location
@@ -221,8 +350,10 @@ def run_predictions(spec):
         alt = spec.launch.alt()
         when = spec.launch.when()
 
-        # Concatenate legs together into single Nx4 array
-        data = np.vstack(solver.solve(when, lat, lng, alt, stages))
+        data = list(
+            solver_to_geocentric(np.array(r))
+            for r in solver.solve(when, lat, lng, alt, stages)
+        )
 
         # Add to data list
         results.append(data)
@@ -234,25 +365,15 @@ def compute_run_statistics(results):
 
     # Compute landing points, sum and sample count. When computing running sum,
     # convert time axis to *relative* time.
-    max_len = np.max(list(r.shape[0] for r in results))
     landing_points = np.zeros((len(results), 4))
-    sample_sum = np.zeros((max_len, 4))
-    sample_count = np.zeros((max_len,), np.int)
     for r_idx, res in enumerate(results):
-        landing_points[r_idx, :] = res[-1, :]
-        sample_sum[:res.shape[0], :] += res
-        sample_sum[:res.shape[0], 0] -= res[0, 0]
-        sample_count[:res.shape[0]] += 1
-
-    # Compute mean track
-    mean_track = sample_sum.copy()
-    mean_track /= np.repeat(sample_count.reshape((-1, 1)), 4, axis=1)
+        landing_points[r_idx, :] = res[-1][-1, :]
 
     # Compute mean and covariance of landing
     landing_mean = np.mean(landing_points, axis=0)
     landing_cov = np.cov(landing_points.T)
 
-    return mean_track, landing_mean, landing_cov
+    return landing_mean, landing_cov
 
 ### PARSING OF SPEC FROM JSON REQUESTS ###
 

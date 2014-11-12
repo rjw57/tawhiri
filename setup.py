@@ -63,7 +63,9 @@ setup(
         "Flask-Script",
         "strict-rfc3339",
         "gunicorn",
-        "numpy"
+        "numpy",
+        "pyproj",
+        "GDAL"
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

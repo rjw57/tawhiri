@@ -26,6 +26,7 @@ from flask import Blueprint, jsonify, request, current_app
 import numpy as np
 from osgeo import ogr, osr, gdal
 import pyproj
+from six.moves import xrange as range # pylint: disable=import-error,redefined-builtin
 from werkzeug.exceptions import BadRequest, NotFound
 
 from tawhiri import solver, models
@@ -33,6 +34,17 @@ from tawhiri.dataset import Dataset as WindDataset
 from ruaumoko import Dataset as ElevationDataset
 
 api = Blueprint('api_experimental', __name__)
+
+# Mapping between prediction output formats and OGR drivers, extensions and
+# media types.
+PREDICT_FORMAT_MAP = {
+    'kmz': ('LibKML', 'kmz', 'application/vnd.google-earth.kmz'),
+    'kml': ('LibKML', 'kml', 'application/vnd.google-earth.kml+xml'),
+}
+
+WGS84_PROJECTION = pyproj.Proj(init='epsg:4326')
+GEOCENT_PROJECTION = pyproj.Proj(proj='geocent', datum='WGS84', units='m')
+WGS84_OGR_SRS = osr.SpatialReference(osr.SRS_WKT_WGS84)
 
 @api.route('/')
 def index():
@@ -55,19 +67,6 @@ def predict():
             cov=landing_cov.tolist(),
         ),
     ))
-
-# Mapping between prediction output formats and OGR drivers, extensions and
-# media types.
-PREDICT_FORMAT_MAP = {
-    'kmz': ('LibKML', 'kmz', 'application/vnd.google-earth.kmz'),
-    'kml': ('LibKML', 'kml', 'application/vnd.google-earth.kml+xml'),
-}
-
-WGS84_OGR_SRS = osr.SpatialReference(osr.SRS_WKT_WGS84)
-assert WGS84_OGR_SRS is not None
-
-WGS84_PROJECTION = pyproj.Proj(init='epsg:4326')
-GEOCENT_PROJECTION = pyproj.Proj(proj='geocent', datum='WGS84', units='m')
 
 @api.route('/predict.<ext>', methods=['POST'])
 def predict_reformat(ext):
@@ -97,9 +96,7 @@ def predict_reformat(ext):
     # Create output file and OGR data source
     with vsi_tempfile('/vsimem/output', extension) as out_fn:
         drv = ogr.GetDriverByName(driver_name)
-        assert drv is not None
         dst_ds = drv.CreateDataSource(out_fn)
-        assert dst_ds is not None
 
         # Create output features
         append_tracks_layer(dst_ds, modal_tracks_wgs84)
@@ -112,16 +109,6 @@ def predict_reformat(ext):
         body_data = vsi_read(out_fn)
 
     return (body_data, 200, {'Content-Type': media_type})
-
-LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
-SimpleAltitudeProfile = namedtuple(
-    'SimpleAltitudeProfile',
-    ['ascent_rate', 'burst_alt', 'descent_rate']
-)
-PredictionSpec = namedtuple(
-    'PredictionSpec',
-    ['launch', 'profile', 'sample_count']
-)
 
 ### FORMATTING OUTPUT ###
 
@@ -234,53 +221,78 @@ def append_2d_covariance_layer(ds, mean, covariance, layer_name='uncertainty'):
     ellipse_axes = sigma_vs[:, np.argsort(sigma_sq_mags)[-2:]]
 
     # Generate ellipse
-    n_thetas = 32
     sigma_fills = ['#FF0000FF', '#FF0000BB', '#FF000088', '#FF000044']
     for sigma_idx, fill in enumerate(sigma_fills):
         sigma = sigma_idx + 1
-
-        thetas = np.linspace(0, 2*np.pi, n_thetas)
-        sins, coss = np.sin(thetas), np.cos(thetas)
-        poly_coords = np.repeat(mean[1:].reshape((1, -1)), n_thetas, axis=0)
-        poly_coords += np.dot(
-            sins.reshape((-1, 1)),
-            sigma * ellipse_axes[:, 0].reshape((1, -1))
-        )
-        poly_coords += np.dot(
-            coss.reshape((-1, 1)),
-            sigma * ellipse_axes[:, 1].reshape((1, -1))
-        )
+        poly_coords = points_on_ellipse(mean[1:], sigma * ellipse_axes)
 
         # Convert polygon co-ordinates to WGS84 lng/lats. Notice that we ignore
         # altitude.
-        coords_wgs84 = np.zeros((n_thetas, 2))
-        coords_wgs84[:, 0], coords_wgs84[:, 1], _ = pyproj.transform(
+        coords_wgs84 = np.vstack(pyproj.transform(
             GEOCENT_PROJECTION, WGS84_PROJECTION,
             poly_coords[:, 0], poly_coords[:, 1], poly_coords[:, 2]
-        )
+        )[:2]).T
+        assert coords_wgs84.shape[1] == 2
 
-        # Create geometry with appropriate coords
-        geom = ogr.Geometry(ogr.wkbPolygon)
-        assert geom is not None
-        geom.AssignSpatialReference(WGS84_OGR_SRS)
-
-        ring_geom = ogr.Geometry(ogr.wkbLinearRing)
-        assert ring_geom is not None
-        ring_geom.AssignSpatialReference(WGS84_OGR_SRS)
-        for lng, lat in coords_wgs84:
-            ring_geom.AddPoint(lng, lat)
-        geom.AddGeometry(ring_geom)
-
-        # Create feature
-        feature = ogr.Feature(layer.GetLayerDefn())
-        assert feature is not None
-        feature.SetGeometry(geom)
+        # Create polygon feature
+        feature = create_simple_polygon(layer.GetLayerDefn(), coords_wgs84)
         feature.SetStyleString('PEN(c:#000000);BRUSH(fc:{0})'.format(fill))
-        feature.SetField('altitudeMode', 'absolute')
         feature.SetField('drawOrder', len(sigma_fills) - sigma_idx)
         layer.CreateFeature(feature)
 
     return feature
+
+def create_simple_polygon(field_defn, coords, srs=WGS84_OGR_SRS):
+    """Create and return an OGR feature representing a polygon with a single
+    external ring. If srs is not None, it is a ogs.SptialReference which should
+    be assigned to the feature.
+
+    *coords* is be a Nx2 array of co-ordinates for the polygon.
+
+    *field_defn* is the feature's field definition.
+
+    """
+    # Create geometry
+    geom = ogr.Geometry(ogr.wkbPolygon)
+    ring_geom = ogr.Geometry(ogr.wkbLinearRing)
+    if srs is not None:
+        geom.AssignSpatialReference(srs)
+        ring_geom.AssignSpatialReference(srs)
+
+    # Set points
+    for lng, lat in coords[:, :2]:
+        ring_geom.AddPoint(lng, lat)
+    geom.AddGeometry(ring_geom)
+
+    # Create feature
+    feature = ogr.Feature(field_defn)
+    feature.SetGeometry(geom)
+    feature.SetField('altitudeMode', 'absolute')
+
+    return feature
+
+def points_on_ellipse(centre, axes, point_count=32):
+    """Return point_count points around the ellpse centres on centre with the
+    specified axes. The axes must be specified as a Nx2 array. The centre point
+    should be a one-dimensional array of length N.
+
+    The points are returned as a point_count x N array.
+
+    """
+    # Check arguments
+    if len(axes.shape) != 2 or axes.shape[1] != 2:
+        raise ValueError('Exactly two axes must be specified')
+
+    # Calculate sin(theta), cos(theta) for each point
+    thetas = np.linspace(0, 2*np.pi, point_count)
+    sins, coss = np.sin(thetas), np.cos(thetas)
+
+    # Create output co-ords array
+    coords = np.repeat(centre.reshape((1, -1)), point_count, axis=0)
+    coords += np.dot(sins.reshape((-1, 1)), axes[:, 0].reshape((1, -1)))
+    coords += np.dot(coss.reshape((-1, 1)), axes[:, 1].reshape((1, -1)))
+
+    return coords
 
 ### STATISTICS ###
 
@@ -301,6 +313,16 @@ def cov_one_sigma_axes(cov):
 
 ### RUNNING THE PREDICTOR ###
 
+LaunchSpec = namedtuple('LaunchSpec', ['lng', 'lat', 'alt', 'when'])
+SimpleAltitudeProfile = namedtuple(
+    'SimpleAltitudeProfile',
+    ['ascent_rate', 'burst_alt', 'descent_rate']
+)
+PredictionSpec = namedtuple(
+    'PredictionSpec',
+    ['launch', 'profile', 'sample_count']
+)
+
 def ruaumoko_ds():
     if not hasattr("ruaumoko_ds", "once"):
         ds_loc = current_app.config.get(
@@ -317,11 +339,10 @@ def solver_to_geocentric(observations):
     metres.
 
     """
-    output = observations.copy()
-    output[:, 1], output[:, 2], output[:, 3] = pyproj.transform(
+    output = np.vstack((observations[:, 0],) + pyproj.transform(
         WGS84_PROJECTION, GEOCENT_PROJECTION,
         observations[:, 2], observations[:, 1], observations[:, 3]
-    )
+    )).T
     return output
 
 def geocentric_to_wgs84(observations):
@@ -332,11 +353,10 @@ def geocentric_to_wgs84(observations):
     inverse of solver_to_geocentric().
 
     """
-    output = observations.copy()
-    output[:, 1], output[:, 2], output[:, 3] = pyproj.transform(
+    output = np.vstack((observations[:, 0],) + pyproj.transform(
         GEOCENT_PROJECTION, WGS84_PROJECTION,
         observations[:, 1], observations[:, 2], observations[:, 3]
-    )
+    )).T
     return output
 
 def run_modal_prediction(spec):
@@ -393,7 +413,6 @@ def run_predictions(spec):
     # Load dataset
     tawhiri_ds = WindDataset.open_latest(persistent=True, directory=ds_dir)
 
-    # TODO: make this Python2 friendly
     results = []
     for _ in range(spec.sample_count):
         # Draw ascent profile

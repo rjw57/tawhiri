@@ -41,7 +41,7 @@ def append_tracks_layer(ds, legs, layer_name='legs'):
     """Create a layer in ds with features representing legs as a LineString.
 
     Legs must be a sequence of Nx4 arrays with rows being time, longitude,
-    latitude and altitude relative to the _WGS84 datum.
+    latitude and altitude relative to the WGS84 datum.
 
     """
     # Create layer

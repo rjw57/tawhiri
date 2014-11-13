@@ -226,9 +226,7 @@ def append_2d_covariance_layer(ds, mean, covariance, layer_name='uncertainty'):
     layer.CreateField(ogr.FieldDefn('drawOrder', ogr.OFTInteger))
 
     # Compute covariance 1 sigma vectors (ignoring time)
-    lambdas, sigma_vs = np.linalg.eig(covariance[1:, 1:])
-    for col_idx in range(3):
-        sigma_vs[:, col_idx] *= np.sqrt(np.maximum(0, lambdas[col_idx]))
+    sigma_vs = cov_one_sigma_axes(covariance[1:, 1:])
 
     # Columns of sigma_vs are x, y, z triples pointing along principal
     # axes of ellipse of uncertainty. Choose those with *largest* uncertainty.
@@ -283,6 +281,23 @@ def append_2d_covariance_layer(ds, mean, covariance, layer_name='uncertainty'):
         layer.CreateFeature(feature)
 
     return feature
+
+### STATISTICS ###
+
+def cov_one_sigma_axes(cov):
+    """Given a NxN array representing a Gaussian covariance return a NxN array
+    whose columns are the principal axes of the one-sigma ellipse. There is no
+    guarantee on the ordering of these axes.
+
+    """
+    if len(cov.shape) != 2 or cov.shape[0] != cov.shape[1]:
+        raise ValueError('covariance must be square')
+
+    lambdas, sigma_vs = np.linalg.eig(cov)
+    for col_idx in range(cov.shape[0]):
+        sigma_vs[:, col_idx] *= np.sqrt(np.maximum(0, lambdas[col_idx]))
+
+    return sigma_vs
 
 ### RUNNING THE PREDICTOR ###
 

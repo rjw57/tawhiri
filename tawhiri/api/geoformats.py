@@ -103,7 +103,7 @@ def append_2d_covariance_layer(ds, mean, covariance, layer_name='uncertainty'):
     sigma_fills = ['#FF0000FF', '#FF0000BB', '#FF000088', '#FF000044']
     for sigma_idx, fill in enumerate(sigma_fills):
         sigma = sigma_idx + 1
-        poly_coords = points_on_ellipse(mean[1:], sigma * ellipse_axes)
+        poly_coords = _points_on_ellipse(mean[1:], sigma * ellipse_axes)
 
         # Convert polygon co-ordinates to _WGS84 lng/lats. Notice that we ignore
         # altitude.
@@ -150,7 +150,7 @@ def _create_simple_polygon(field_defn, coords, srs=_WGS84_OGR_SRS):
 
     return feature
 
-def points_on_ellipse(centre, axes, point_count=32):
+def _points_on_ellipse(centre, axes, point_count=32):
     """Return point_count points around the ellpse centres on centre with the
     specified axes. The axes must be specified as a Nx2 array. The centre point
     should be a one-dimensional array of length N.

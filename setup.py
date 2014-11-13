@@ -65,7 +65,8 @@ setup(
         "gunicorn",
         "numpy",
         "pyproj",
-        "GDAL"
+        "GDAL",
+        "six"
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

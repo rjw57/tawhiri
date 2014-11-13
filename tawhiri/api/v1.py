@@ -28,7 +28,7 @@ from tawhiri import solver, models
 from tawhiri.dataset import Dataset as WindDataset
 from ruaumoko import Dataset as ElevationDataset
 
-api_v1 = Blueprint('api_v1', __name__)
+api = Blueprint('api_v1', __name__)
 
 LATEST_DATASET_KEYWORD = "latest"
 PROFILE_STANDARD = "standard_profile"
@@ -273,7 +273,7 @@ def _parse_stages(labels, data):
 
 
 # Flask App ###################################################################
-@api_v1.route('/')
+@api.route('/')
 def main():
     """
     Single API endpoint which accepts GET requests.
@@ -285,7 +285,7 @@ def main():
     return jsonify(response)
 
 
-@api_v1.errorhandler(APIException)
+@api.errorhandler(APIException)
 def handle_exception(error):
     """
     Return correct error message and HTTP status code for API exceptions.

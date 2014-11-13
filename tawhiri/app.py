@@ -21,8 +21,8 @@ The main Tawhiri web application
 
 from flask import Flask
 
-from .api import api_v1
-from .experimentalapi import api as api_experimental
+from .api.v1 import api as api_v1
+from .api.experimental import api as api_experimental
 
 app = Flask(__name__)
 app.register_blueprint(api_v1, url_prefix='/api/v1')

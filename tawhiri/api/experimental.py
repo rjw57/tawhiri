@@ -71,7 +71,7 @@ def predict_reformat(ext):
     # Which OGR driver should we use for this?
     try:
         driver_name, extension, media_type = PREDICT_FORMAT_MAP[ext]
-    except TypeError as e:
+    except KeyError as e:
         # If we're running in debug mode, raise the original exception
         # otherwise, treat as if this endpoint doesn't exit.
         if current_app.debug:

@@ -16,7 +16,7 @@
 # along with Tawhiri.  If not, see <http://www.gnu.org/licenses/>.
 
 """
-Provide the HTTP API for Tawhiri.
+Provide the v1 HTTP API for Tawhiri as a Flask Blueprint.
 """
 
 from flask import Blueprint, jsonify, request, g, current_app
@@ -30,11 +30,9 @@ from ruaumoko import Dataset as ElevationDataset
 
 api = Blueprint('api_v1', __name__)
 
-API_VERSION = 1
 LATEST_DATASET_KEYWORD = "latest"
 PROFILE_STANDARD = "standard_profile"
 PROFILE_FLOAT = "float_profile"
-
 
 # Util functions ##############################################################
 def ruaumoko_ds():
@@ -106,7 +104,7 @@ def parse_request(data):
     """
     Parse the request.
     """
-    req = {"version": API_VERSION}
+    req = {"version": 1}
 
     # Generic fields
     req['launch_latitude'] = \
